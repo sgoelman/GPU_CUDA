@@ -21,7 +21,7 @@ inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort =
         if (abort) exit(code);
     }
 }
-void computeGold(float* reference, float* idata, const unsigned int len);
+double computeGold(float* reference, float* idata, const unsigned int len);
 
 
 #define DEFAULT_MATRIX_SIZE 1024
@@ -30,14 +30,14 @@ void computeGold(float* reference, float* idata, const unsigned int len);
 ////////////////////////////////////////////////////////////////////////////////
 // declaration, forward
 void runSequentialTest(float* A, float* L, const unsigned int dimensionSize);
-void runCUDATest_NormalS(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
-    const int threads_per_block, const int cutoff, const int deviceId);
-void runCUDATest_NormalM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
-    const int threads_per_block, const int cutoff, const int deviceId);
-void runCUDATest_InPlaceM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
-    const int threads_per_block, const int cutoff, const int deviceId);
-void runCuSolverTest(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
-    const int deviceId);
+float runCUDATest_NormalS(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
+    const int threads_per_block, const int cutoff);
+float runCUDATest_NormalM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
+    const int threads_per_block, const int cutoff);
+float runCUDATest_InPlaceM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
+    const int threads_per_block, const int cutoff);
+float runCuSolverTest(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize);
+void writeResultToFile(char* name, float* contentGPU, double* contentCPU, int LIST_SIZE);
 
 ////////////////////////////////////////////////////////////////////////////////
 // matrix helper functions
@@ -48,8 +48,7 @@ float spd_random_float(float fMin, float fMax);
 void spd_print_matrixf(float* A, unsigned int dimension, int count);
 int spd_compare_matricesf(float* A, float* B, int dimension, float epsilon);
 void spd_free_matrixf(float* A);
-
-
+float* transpose(float* h_Adata, int dimensionSize);
 ////////////////////////////////////////////////////////////////////////////////
 //! Cholesky Kernel for a single column. Normal Single Kernel
 //! @param A              input data in global memory
@@ -57,9 +56,7 @@ void spd_free_matrixf(float* A);
 //! @param dimensionSize  width of matrices
 //! @param col            current column
 ////////////////////////////////////////////////////////////////////////////////
-__global__ void
-choleskyKernel_NormalS(float* A, float* L, int dimensionSize, int col)
-{
+__global__ void choleskyKernel_NormalS(float* A, float* L, int dimensionSize, int col){
     const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int row = col + tid;
     int k;
@@ -144,8 +141,7 @@ choleskyKernel_InPlaceM1(float* A, int dimensionSize, int col)
     }
     A[col * dimensionSize + col] = sqrtf(A[col * dimensionSize + col] - sum_d);
 }
-__global__ void
-choleskyKernel_InPlaceM2(float* A, int dimensionSize, int col)
+__global__ void choleskyKernel_InPlaceM2(float* A, int dimensionSize, int col)
 {
     const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int row = col + tid + 1;
@@ -163,15 +159,57 @@ choleskyKernel_InPlaceM2(float* A, int dimensionSize, int col)
     }
 }
 
+template <int BLOCK_SIZE> __global__ void chol_kernel(float* A, int dimensionSize, int col)
+{
+
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    int tx = tid + bid * BLOCK_SIZE;
+    unsigned int i, j, k;
+    unsigned int num_rows = dimensionSize;
+    for (k = 0; k < num_rows; k++)
+    {
+        if (tx == 0)
+        {
+            for (j = (k + 1); j < num_rows; j++)
+            {
+                A[k * num_rows + j] /= A[k * num_rows + k];
+            }
+            A[k * num_rows + k] = sqrt(A[k * num_rows + k]);
+        }
+        __syncthreads();
+
+        for (i = (k + 1) + bid * BLOCK_SIZE + tid; i < num_rows; i += 2 * BLOCK_SIZE)
+        {
+            for (j = i; j < num_rows; j++)
+            {
+                A[i * num_rows + j] -= A[k * num_rows + i] * A[k * num_rows + j];
+            }
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+
+
+    for (i = bid * BLOCK_SIZE + tid; i < num_rows; i += 2 * BLOCK_SIZE)
+    {
+        for (j = 0; j < i; j++)
+            A[i * num_rows + j] = 0.0;
+    }
+}
+
+
 ////////////////////////////////////////////////////////////////////////////////
 // Program main
 ////////////////////////////////////////////////////////////////////////////////
 int main(int argc, char** argv)
 {
+    
+    int LIST_SIZE = 8;
+    char* name = (char*)malloc(20 * sizeof(char));
     // Read from command line: size, algorithm (Sequential or CUDA), device
-    unsigned int dimensionSize = (argc >= 2) ?
-        atoi(argv[1]) :
-        DEFAULT_MATRIX_SIZE;
+    float* timersGPU = (float*)malloc(LIST_SIZE * sizeof(float));
+    double* timersCPU = (double*)malloc(LIST_SIZE * sizeof(double));
     unsigned int algorithm = (argc >= 3) ?
         atoi(argv[2]) :
         0;
@@ -191,74 +229,102 @@ int main(int argc, char** argv)
         return 0;
 
     // check if tpb and max blocks are compatible with device
-    cudaDeviceProp devProp;
-    cudaGetDeviceProperties(&devProp, deviceId);
-    if (threads_per_block > devProp.maxThreadsPerBlock ||
-        (ceil((float)(dimensionSize) / (float)threads_per_block) > devProp.maxThreadsDim[0]))
-        return 0;
+   
+    for (int index = 0, unsigned int dimensionSize = 32; dimensionSize <= 4096; index++, dimensionSize *= 2) {
+        cudaDeviceProp devProp;
+        cudaGetDeviceProperties(&devProp, deviceId);
+        if (threads_per_block > devProp.maxThreadsPerBlock ||
+            (ceil((float)(dimensionSize) / (float)threads_per_block) > devProp.maxThreadsDim[0]))
+            return 0;
 
-    if (cutoff >= dimensionSize)
-        return 0; // if cutoff is greater or equals than the input size, cancel execution
-
+        if (cutoff >= dimensionSize)
+            return 0; // if cutoff is greater or equals than the input size, cancel execution
       // allocate and initialize host memory for input and output
     float* h_Adata = spd_create_symetricf(dimensionSize, 1, 100);
     spd_make_positive_definitef(h_Adata, dimensionSize, 50000);
     float* h_Ldata = spd_create_blankf(dimensionSize);
-
+    
     // run test, depending on algorithm
     switch (algorithm) {
         // Sequential
     case 0:
+        name = "Sequential";
         printf("%d,Sequential,", dimensionSize);
         runSequentialTest(h_Adata, h_Ldata, dimensionSize);
         break;
 
         // CUDA Normal Single Kernel
     case 1:
+        name = "SingleKarnel";
         printf("%d,CUDA_NormalS,%d,%d,", dimensionSize, threads_per_block, cutoff);
-        runCUDATest_NormalS(h_Adata, h_Ldata, dimensionSize, threads_per_block, cutoff, deviceId);
+        timersGPU[index] =  runCUDATest_NormalS(h_Adata, h_Ldata, dimensionSize, threads_per_block, cutoff);
         break;
 
         // CUDA Normal Multiple Kernels
     case 2:
+        name = "MultiKarnel";
         printf("%d,CUDA_NormalM,%d,%d,", dimensionSize, threads_per_block, cutoff);
-        runCUDATest_NormalM(h_Adata, h_Ldata, dimensionSize, threads_per_block, cutoff, deviceId);
+        timersGPU[index] = runCUDATest_NormalM(h_Adata, h_Ldata, dimensionSize, threads_per_block, cutoff);
         break;
 
         // CUDA InPlace Multiple Kernels
     case 3:
+        name = "InPlaceMultiKarnel";
         printf("%d,CUDA_InPlaceM,%d,%d,", dimensionSize, threads_per_block, cutoff);
-        runCUDATest_InPlaceM(h_Adata, h_Ldata, dimensionSize, threads_per_block, cutoff, deviceId);
+        timersGPU[index] = runCUDATest_InPlaceM(h_Adata, h_Ldata, dimensionSize, threads_per_block, cutoff);
         break;
 
         // CuSolver
     case 4:
+        name = "CUSOLVER";
         printf("%d,CUSOLVER,", dimensionSize);
-        runCuSolverTest(h_Adata, h_Ldata, dimensionSize, deviceId);
+        timersGPU[index] = runCuSolverTest(h_Adata, h_Ldata, dimensionSize);
         break;
     }
 
-  
-        // compute reference solution
-        float* h_LGdata = spd_create_blankf(dimensionSize);
-        computeGold(h_Adata, h_LGdata, dimensionSize);
-        printf("Input Matrix:\n");
-        spd_print_matrixf(h_Adata, dimensionSize, 8);
-        printf("Gold Matrix:\n");
-        spd_print_matrixf(h_LGdata, dimensionSize, 8);
-        printf("GPU Output Matrix:\n");
-        spd_print_matrixf(h_Ldata, dimensionSize, 8);
-        printf("Comparing ... ");
-        spd_compare_matricesf(h_Ldata, h_LGdata, dimensionSize, 0.0001);
-        spd_free_matrixf(h_LGdata);
-    
+
+    // compute reference solution
+    float* h_LGdata = spd_create_blankf(dimensionSize);
+    timersCPU[index] = computeGold(h_Adata, h_LGdata, dimensionSize);
+    printf("Input Matrix:\n");
+    spd_print_matrixf(h_Adata, dimensionSize, 8);
+    printf("Gold Matrix:\n");
+    spd_print_matrixf(h_LGdata, dimensionSize, 8);
+    printf("GPU Output Matrix:\n");
+    spd_print_matrixf(h_Ldata, dimensionSize, 8);
+    printf("Comparing ... ");
+    spd_compare_matricesf(h_Ldata, h_LGdata, dimensionSize, 0.0001);
+    spd_free_matrixf(h_LGdata);
+
 
     // free matrices
     spd_free_matrixf(h_Adata);
     spd_free_matrixf(h_Ldata);
 
+}
+    writeResultToFile(name, timersGPU, timersCPU, LIST_SIZE);
     // exit
     exit(EXIT_SUCCESS);
+}
+
+void writeResultToFile(char* name, float* contentGPU, double* contentCPU,int LIST_SIZE) {
+    FILE* f = fopen(name, "a");
+    for (int i = 0; i < LIST_SIZE; i++) {
+        fprintf(f, "%f, %0.8f \n", contentGPU[i], contentCPU[i]);
+    }
+    fprintf(f, "\n");
+    fclose(f);
+}
+
+
+float* transpose(float* h_Adata,int dimensionSize) {
+    float* elements = (float*)malloc(dimensionSize * dimensionSize * sizeof(float));
+
+    for (int i = 0; i < dimensionSize; i++)
+        for (int j = 0; j < dimensionSize; j++)
+            elements[i * dimensionSize + j] = h_Adata[j * dimensionSize + i];
+    spd_free_matrixf(h_Adata);
+    return elements;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -300,8 +366,8 @@ void runSequentialTest(float* A, float* L, const unsigned int dimensionSize)
 ////////////////////////////////////////////////////////////////////////////////
 //! Run CUDA test. Normal Single Kernel
 ////////////////////////////////////////////////////////////////////////////////
-void runCUDATest_NormalS(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
-    const int threads_per_block, const int cutoff, const int deviceId)
+float runCUDATest_NormalS(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
+    const int threads_per_block, const int cutoff)
 {
     // set device id
     // initialize timer
@@ -327,11 +393,10 @@ void runCUDATest_NormalS(float* h_Adata, float* h_Ldata, const unsigned int dime
     int num_blocks;
     for (j = 0; j < dimensionSize - cutoff; j++) {
         num_blocks = ceil((float)(dimensionSize - j) / (float)threads_per_block);
-        choleskyKernel_NormalS << < num_blocks, threads_per_block >> > (d_Adata, d_Ldata, dimensionSize, j);
+        choleskyKernel_NormalS <<< num_blocks, threads_per_block >> > (d_Adata, d_Ldata, dimensionSize, j);
     }
 
     // check if kernel execution generated and error
-    printf("Kernel execution failed");
 
     // copy result from device to host
     gpuErrchk(cudaMemcpy(h_Ldata, d_Ldata, mem_size,
@@ -370,15 +435,13 @@ void runCUDATest_NormalS(float* h_Adata, float* h_Ldata, const unsigned int dime
     // cleanup memory
     gpuErrchk(cudaFree(d_Adata));
     gpuErrchk(cudaFree(d_Ldata));
+    return timerResoultList;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 //! Run CUDA test. Normal Multiple Kernel
 ////////////////////////////////////////////////////////////////////////////////
-void
-runCUDATest_NormalM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
-    const int threads_per_block, const int cutoff, const int deviceId)
-{
+float runCUDATest_NormalM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize, const int threads_per_block, const int cutoff){
     cudaEvent_t start, stop;
     gpuErrchk(cudaEventCreate(&start));
     gpuErrchk(cudaEventCreate(&stop));
@@ -419,7 +482,6 @@ runCUDATest_NormalM(float* h_Adata, float* h_Ldata, const unsigned int dimension
     }
 
     // check if kernel execution generated and error
-    printf("Kernel execution failed");
 
     // copy result from device to host
     gpuErrchk(cudaMemcpy(h_Ldata, d_Ldata, mem_size,
@@ -459,18 +521,13 @@ runCUDATest_NormalM(float* h_Adata, float* h_Ldata, const unsigned int dimension
     // cleanup memory
     gpuErrchk(cudaFree(d_Adata));
     gpuErrchk(cudaFree(d_Ldata));
+    return timerResoultList;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 //! Run CUDA test. In-Place Multiple Kernel
 ////////////////////////////////////////////////////////////////////////////////
-void
-runCUDATest_InPlaceM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
-    const int threads_per_block, const int cutoff, const int deviceId)
-{
-
-    // initialize timer
-    // initialize timer
+float runCUDATest_InPlaceM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize, const int threads_per_block, const int cutoff){
     cudaEvent_t start, stop;
     gpuErrchk(cudaEventCreate(&start));
     gpuErrchk(cudaEventCreate(&stop));
@@ -504,8 +561,6 @@ runCUDATest_InPlaceM(float* h_Adata, float* h_Ldata, const unsigned int dimensio
         choleskyKernel_InPlaceM1 <<< 1, 1 >> > (d_Adata, dimensionSize, j);
     }
 
-    // check if kernel execution generated and error
-    printf("Kernel execution failed");
 
     // copy result from device to host
     gpuErrchk(cudaMemcpy(h_Ldata, d_Adata, mem_size,
@@ -551,13 +606,13 @@ runCUDATest_InPlaceM(float* h_Adata, float* h_Ldata, const unsigned int dimensio
 
     // cleanup memory
     gpuErrchk(cudaFree(d_Adata));
+    return timerResoultList;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 //! Run cuSolver test
 ////////////////////////////////////////////////////////////////////////////////
-void runCuSolverTest(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
-    const int deviceId)
+float runCuSolverTest(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize)
 {
 
 
@@ -621,6 +676,7 @@ void runCuSolverTest(float* h_Adata, float* h_Ldata, const unsigned int dimensio
     printf("%0.8f\n", timerResoultList );
     // cleanup memory
     gpuErrchk(cudaFree(d_Adata));
+    return timerResoultList;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -726,7 +782,7 @@ double computeSumOnGpu(double* h_data, int size, int num_threads) {
     return result;
 }
 
-void computeGold(float* A, float* L, const unsigned int dimensionSize)
+double computeGold(float* A, float* L, const unsigned int dimensionSize)
 {
     clock_t start, end;
     double cpu_time_used;
@@ -753,5 +809,5 @@ void computeGold(float* A, float* L, const unsigned int dimensionSize)
     end = clock();
     cpu_time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
     printf("%0.8f\n", cpu_time_used);
-
+    return cpu_time_used;
 }
