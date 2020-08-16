@@ -38,6 +38,7 @@ float runCUDATest_InPlaceM(float* h_Adata, float* h_Ldata, const unsigned int di
     const int threads_per_block, const int cutoff);
 float runCuSolverTest(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize);
 void writeResultToFile(char* name, float* contentGPU, double* contentCPU, int LIST_SIZE);
+float computeSyncSingleKarnelOneBlock(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize, const int threads_per_block);
 
 ////////////////////////////////////////////////////////////////////////////////
 // matrix helper functions
@@ -159,46 +160,41 @@ __global__ void choleskyKernel_InPlaceM2(float* A, int dimensionSize, int col)
     }
 }
 
-template <int BLOCK_SIZE> __global__ void chol_kernel(float* A, int dimensionSize, int col)
+template <int BLOCK_SIZE> __global__ void chol_kernel_one_block(float* U, unsigned int num_rows)
 {
-
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
-    int tx = tid + bid * BLOCK_SIZE;
+    int tx = tid + bid ;
     unsigned int i, j, k;
-    unsigned int num_rows = dimensionSize;
     for (k = 0; k < num_rows; k++)
     {
         if (tx == 0)
         {
+            U[k * num_rows + k] = sqrt(U[k * num_rows + k]);
             for (j = (k + 1); j < num_rows; j++)
             {
-                A[k * num_rows + j] /= A[k * num_rows + k];
+                U[k * num_rows + j] /= U[k * num_rows + k];
             }
-            A[k * num_rows + k] = sqrt(A[k * num_rows + k]);
         }
         __syncthreads();
 
-        for (i = (k + 1) + bid * BLOCK_SIZE + tid; i < num_rows; i += 2 * BLOCK_SIZE)
+        for (i = (k + 1) + bid  + tid; i < num_rows; i += BLOCK_SIZE )
         {
             for (j = i; j < num_rows; j++)
             {
-                A[i * num_rows + j] -= A[k * num_rows + i] * A[k * num_rows + j];
+                U[i * num_rows + j] -= U[k * num_rows + i] * U[k * num_rows + j];
             }
         }
         __syncthreads();
     }
     __syncthreads();
 
-
-    for (i = bid * BLOCK_SIZE + tid; i < num_rows; i += 2 * BLOCK_SIZE)
+    for (i = bid  + tid; i < num_rows; i += BLOCK_SIZE )
     {
         for (j = 0; j < i; j++)
-            A[i * num_rows + j] = 0.0;
+            U[i * num_rows + j] = 0.0;
     }
 }
-
-
 ////////////////////////////////////////////////////////////////////////////////
 // Program main
 ////////////////////////////////////////////////////////////////////////////////
@@ -280,6 +276,15 @@ int main(int argc, char** argv)
         printf("%d,CUSOLVER,", dimensionSize);
         timersGPU[index] = runCuSolverTest(h_Adata, h_Ldata, dimensionSize);
         break;
+
+    case 5:
+        name = "SyncChols";
+        printf("%d,SyncChols,%d,%d,", dimensionSize, threads_per_block, cutoff);
+        timersGPU[index] = computeSyncSingleKarnelOneBlock(h_Adata, h_Ldata, dimensionSize, threads_per_block);
+        h_Ldata = transpose(h_Ldata, dimensionSize);
+
+        break;
+        break;
     }
 
 
@@ -287,11 +292,11 @@ int main(int argc, char** argv)
     float* h_LGdata = spd_create_blankf(dimensionSize);
     timersCPU[index] = computeGold(h_Adata, h_LGdata, dimensionSize);
     printf("Input Matrix:\n");
-    spd_print_matrixf(h_Adata, dimensionSize, 8);
+    spd_print_matrixf(h_Adata, dimensionSize, 16);
     printf("Gold Matrix:\n");
-    spd_print_matrixf(h_LGdata, dimensionSize, 8);
+    spd_print_matrixf(h_LGdata, dimensionSize, 16);
     printf("GPU Output Matrix:\n");
-    spd_print_matrixf(h_Ldata, dimensionSize, 8);
+    spd_print_matrixf(h_Ldata, dimensionSize, 16);
     printf("Comparing ... ");
     spd_compare_matricesf(h_Ldata, h_LGdata, dimensionSize, 0.0001);
     spd_free_matrixf(h_LGdata);
@@ -524,6 +529,41 @@ float runCUDATest_NormalM(float* h_Adata, float* h_Ldata, const unsigned int dim
     return timerResoultList;
 }
 
+float computeSyncSingleKarnelOneBlock(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize ,const int threads_per_block) {
+    float* d_Adata;
+
+    cudaEvent_t start, stop;
+
+    unsigned int mem_size = sizeof(float) * dimensionSize * dimensionSize;
+    gpuErrchk(cudaMalloc((void**)&d_Adata, mem_size));
+    gpuErrchk(cudaMemcpy(d_Adata, h_Adata, mem_size,
+        cudaMemcpyHostToDevice));
+
+
+    gpuErrchk(cudaEventCreate(&start));
+    gpuErrchk(cudaEventCreate(&stop));
+    gpuErrchk(cudaEventRecord(start));
+    //Operations per thread
+    int num_blocks = ceil((float)(dimensionSize) / (float)threads_per_block);
+
+   //float ops_per_thread = dimensionSize / (threads_per_block * num_blocks);
+
+    dim3 thread_block(threads_per_block, 1, 1);
+    dim3 grid(num_blocks, 1);
+
+    chol_kernel_one_block<16><<<grid, thread_block >> > (d_Adata,dimensionSize);
+    cudaDeviceSynchronize();
+    gpuErrchk(cudaEventRecord(stop));
+    gpuErrchk(cudaEventSynchronize(stop));
+    float msecTotal = 0.0f;
+    gpuErrchk(cudaEventElapsedTime(&msecTotal, start, stop));
+    float timerResoultList = msecTotal / 1000;
+
+    // copy result from device to host
+    gpuErrchk(cudaMemcpy(h_Ldata, d_Adata, mem_size, cudaMemcpyDeviceToHost));
+    gpuErrchk(cudaFree(d_Adata));
+    return timerResoultList;
+}
 ////////////////////////////////////////////////////////////////////////////////
 //! Run CUDA test. In-Place Multiple Kernel
 ////////////////////////////////////////////////////////////////////////////////
@@ -754,33 +794,7 @@ void spd_free_matrixf(float* A)
 }
 
 
-double computeSumOnGpu(double* h_data, int size, int num_threads) {
-    double* d_in;
-    double* d_out;
-    double result;
-    cudaEvent_t start, stop;
 
-    cudaMalloc(&d_in, sizeof(double) * size);
-    cudaMemcpy(d_in, h_data, sizeof(double) * size, cudaMemcpyHostToDevice);
-
-    cudaMalloc((void**)&d_out, sizeof(double) * size);
-
-
-    gpuErrchk(cudaEventCreate(&start));
-    gpuErrchk(cudaEventCreate(&stop));
-    gpuErrchk(cudaEventRecord(start));
-//here insert the cuda karnel
-    gpuErrchk(cudaEventRecord(stop));
-    gpuErrchk(cudaEventSynchronize(stop));
-    float msecTotal = 0.0f;
-    gpuErrchk(cudaEventElapsedTime(&msecTotal, start, stop));
-    float timerResoultList = msecTotal / 1000;
-
-    cudaMemcpy(&result, d_out, sizeof(double), cudaMemcpyDeviceToHost);
-    gpuErrchk(cudaFree(d_out));
-    gpuErrchk(cudaFree(d_in));
-    return result;
-}
 
 double computeGold(float* A, float* L, const unsigned int dimensionSize)
 {
