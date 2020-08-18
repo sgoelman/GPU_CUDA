@@ -226,7 +226,7 @@ int main(int argc, char** argv)
 
     // check if tpb and max blocks are compatible with device
    
-    for (int index = 0, unsigned int dimensionSize = 32; dimensionSize <= 4096; index++, dimensionSize *= 2) {
+    for (int index = 0, unsigned int dimensionSize = 32; dimensionSize <= 1024; index++, dimensionSize *= 2) {
         cudaDeviceProp devProp;
         cudaGetDeviceProperties(&devProp, deviceId);
         if (threads_per_block > devProp.maxThreadsPerBlock ||
@@ -298,7 +298,7 @@ int main(int argc, char** argv)
     printf("GPU Output Matrix:\n");
     spd_print_matrixf(h_Ldata, dimensionSize, 16);
     printf("Comparing ... ");
-    spd_compare_matricesf(h_Ldata, h_LGdata, dimensionSize, 0.0001);
+    spd_compare_matricesf(h_Ldata, h_LGdata, dimensionSize, 0.001);
     spd_free_matrixf(h_LGdata);
 
 
@@ -538,20 +538,38 @@ float computeSyncSingleKarnelOneBlock(float* h_Adata, float* h_Ldata, const unsi
     gpuErrchk(cudaMalloc((void**)&d_Adata, mem_size));
     gpuErrchk(cudaMemcpy(d_Adata, h_Adata, mem_size,
         cudaMemcpyHostToDevice));
-
-
     gpuErrchk(cudaEventCreate(&start));
     gpuErrchk(cudaEventCreate(&stop));
     gpuErrchk(cudaEventRecord(start));
     //Operations per thread
-    int num_blocks = ceil((float)(dimensionSize) / (float)threads_per_block);
+    int num_blocks = ceil((float)(dimensionSize) / (float)dimensionSize);
 
    //float ops_per_thread = dimensionSize / (threads_per_block * num_blocks);
 
-    dim3 thread_block(threads_per_block, 1, 1);
+    dim3 thread_block(dimensionSize, 1, 1);
     dim3 grid(num_blocks, 1);
+    if (dimensionSize == 32) {
+        chol_kernel_one_block<32> << <grid, thread_block >> > (d_Adata, dimensionSize);
+    }
+    else  if (dimensionSize == 64) {
+        chol_kernel_one_block<64> << <grid, thread_block >> > (d_Adata, dimensionSize);
+    }
+    else  if (dimensionSize == 128) {
+        chol_kernel_one_block<128> << <grid, thread_block >> > (d_Adata, dimensionSize);
+    }
+    else  if (dimensionSize == 256) {
+        chol_kernel_one_block<256> << <grid, thread_block >> > (d_Adata, dimensionSize);
+    }
 
-    chol_kernel_one_block<16><<<grid, thread_block >> > (d_Adata,dimensionSize);
+    else  if (dimensionSize == 512) {
+        chol_kernel_one_block<512> << <grid, thread_block >> > (d_Adata, dimensionSize);
+    }
+    else  if (dimensionSize == 1024) {
+        chol_kernel_one_block<1024> << <grid, thread_block >> > (d_Adata, dimensionSize);
+    }
+    else  if (dimensionSize == 2048) {
+        chol_kernel_one_block<2048> << <grid, thread_block >> > (d_Adata, dimensionSize);
+    }
     cudaDeviceSynchronize();
     gpuErrchk(cudaEventRecord(stop));
     gpuErrchk(cudaEventSynchronize(stop));
