@@ -32,9 +32,9 @@ double computeGold(float* reference, float* idata, const unsigned int len);
 void runSequentialTest(float* A, float* L, const unsigned int dimensionSize);
 float runCUDATest_NormalS(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
     const int threads_per_block, const int cutoff);
-float runCUDATest_NormalM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
+float runCUDACholeskyByTheBook(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
     const int threads_per_block, const int cutoff);
-float runCUDATest_InPlaceM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
+float runCUDACholeskyByTheBookInPlaceM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize,
     const int threads_per_block, const int cutoff);
 float runCuSolverTest(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize);
 void writeResultToFile(char* name, float* contentGPU, double* contentCPU, int LIST_SIZE);
@@ -57,7 +57,7 @@ float* transpose(float* h_Adata, int dimensionSize);
 //! @param dimensionSize  width of matrices
 //! @param col            current column
 ////////////////////////////////////////////////////////////////////////////////
-__global__ void choleskyKernel_NormalS(float* A, float* L, int dimensionSize, int col){
+__global__ void choleskyByTheBookSingleKarnel(float* A, float* L, int dimensionSize, int col){
     const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int row = col + tid;
     int k;
@@ -94,7 +94,7 @@ __global__ void choleskyKernel_NormalS(float* A, float* L, int dimensionSize, in
 //! @param col            current column
 ////////////////////////////////////////////////////////////////////////////////
 __global__ void
-choleskyKernel_NormalM1(float* A, float* L, int dimensionSize, int col)
+choleskyByTheBookMKernelDiagonal(float* A, float* L, int dimensionSize, int col)
 {
     int k;
     float sum_d = 0;
@@ -106,7 +106,7 @@ choleskyKernel_NormalM1(float* A, float* L, int dimensionSize, int col)
     L[col * dimensionSize + col] = sqrtf(A[col * dimensionSize + col] - sum_d);
 }
 __global__ void
-choleskyKernel_NormalM2(float* A, float* L, int dimensionSize, int col)
+choleskyByTheBookMKernelBelowDiagonal(float* A, float* L, int dimensionSize, int col)
 {
     const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int row = col + tid + 1;
@@ -131,7 +131,7 @@ choleskyKernel_NormalM2(float* A, float* L, int dimensionSize, int col)
 //! @param col            current column
 ////////////////////////////////////////////////////////////////////////////////
 __global__ void
-choleskyKernel_InPlaceM1(float* A, int dimensionSize, int col)
+choleskyByTheBookInPlaceDiagonal(float* A, int dimensionSize, int col)
 {
     int k;
     float sum_d = 0;
@@ -142,7 +142,7 @@ choleskyKernel_InPlaceM1(float* A, int dimensionSize, int col)
     }
     A[col * dimensionSize + col] = sqrtf(A[col * dimensionSize + col] - sum_d);
 }
-__global__ void choleskyKernel_InPlaceM2(float* A, int dimensionSize, int col)
+__global__ void choleskyByTheBookInPlaceBelowDiagonal(float* A, int dimensionSize, int col)
 {
     const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int row = col + tid + 1;
@@ -260,14 +260,14 @@ int main(int argc, char** argv)
     case 2:
         name = "MultiKarnel";
         printf("%d,CUDA_NormalM,%d,%d,", dimensionSize, threads_per_block, cutoff);
-        timersGPU[index] = runCUDATest_NormalM(h_Adata, h_Ldata, dimensionSize, threads_per_block, cutoff);
+        timersGPU[index] = runCUDACholeskyByTheBook(h_Adata, h_Ldata, dimensionSize, threads_per_block, cutoff);
         break;
 
         // CUDA InPlace Multiple Kernels
     case 3:
         name = "InPlaceMultiKarnel";
         printf("%d,CUDA_InPlaceM,%d,%d,", dimensionSize, threads_per_block, cutoff);
-        timersGPU[index] = runCUDATest_InPlaceM(h_Adata, h_Ldata, dimensionSize, threads_per_block, cutoff);
+        timersGPU[index] = runCUDACholeskyByTheBookInPlaceM(h_Adata, h_Ldata, dimensionSize, threads_per_block, cutoff);
         break;
 
         // CuSolver
@@ -398,7 +398,7 @@ float runCUDATest_NormalS(float* h_Adata, float* h_Ldata, const unsigned int dim
     int num_blocks;
     for (j = 0; j < dimensionSize - cutoff; j++) {
         num_blocks = ceil((float)(dimensionSize - j) / (float)threads_per_block);
-        choleskyKernel_NormalS <<< num_blocks, threads_per_block >> > (d_Adata, d_Ldata, dimensionSize, j);
+        choleskyByTheBookSingleKarnel <<< num_blocks, threads_per_block >> > (d_Adata, d_Ldata, dimensionSize, j);
     }
 
     // check if kernel execution generated and error
@@ -446,7 +446,7 @@ float runCUDATest_NormalS(float* h_Adata, float* h_Ldata, const unsigned int dim
 ////////////////////////////////////////////////////////////////////////////////
 //! Run CUDA test. Normal Multiple Kernel
 ////////////////////////////////////////////////////////////////////////////////
-float runCUDATest_NormalM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize, const int threads_per_block, const int cutoff){
+float runCUDACholeskyByTheBook(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize, const int threads_per_block, const int cutoff){
     cudaEvent_t start, stop;
     gpuErrchk(cudaEventCreate(&start));
     gpuErrchk(cudaEventCreate(&stop));
@@ -472,18 +472,18 @@ float runCUDATest_NormalM(float* h_Adata, float* h_Ldata, const unsigned int dim
         // some processing will be on host
         for (j = 0; j < dimensionSize - cutoff; j++) {
             num_blocks = ceil((float)(dimensionSize - j) / (float)threads_per_block);
-            choleskyKernel_NormalM1 <<< 1, 1 >> > (d_Adata, d_Ldata, dimensionSize, j);
-            choleskyKernel_NormalM2 <<< num_blocks, threads_per_block >> > (d_Adata, d_Ldata, dimensionSize, j);
+            choleskyByTheBookMKernelDiagonal <<< 1, 1 >> > (d_Adata, d_Ldata, dimensionSize, j);
+            choleskyByTheBookMKernelBelowDiagonal <<< num_blocks, threads_per_block >> > (d_Adata, d_Ldata, dimensionSize, j);
         }
     }
     else {
         // cutoff = 0, all processing will be on GPU
         for (j = 0; j < dimensionSize - 1; j++) {
             num_blocks = ceil((float)(dimensionSize - j) / (float)threads_per_block);
-            choleskyKernel_NormalM1 <<< 1, 1 >> > (d_Adata, d_Ldata, dimensionSize, j);
-            choleskyKernel_NormalM2 <<< num_blocks, threads_per_block >> > (d_Adata, d_Ldata, dimensionSize, j);
+            choleskyByTheBookMKernelDiagonal <<< 1, 1 >> > (d_Adata, d_Ldata, dimensionSize, j);
+            choleskyByTheBookMKernelBelowDiagonal <<< num_blocks, threads_per_block >> > (d_Adata, d_Ldata, dimensionSize, j);
         }
-        choleskyKernel_NormalM1 <<< 1, 1 >> > (d_Adata, d_Ldata, dimensionSize, j);
+        choleskyByTheBookMKernelDiagonal <<< 1, 1 >> > (d_Adata, d_Ldata, dimensionSize, j);
     }
 
     // check if kernel execution generated and error
@@ -585,7 +585,7 @@ float computeSyncSingleKarnelOneBlock(float* h_Adata, float* h_Ldata, const unsi
 ////////////////////////////////////////////////////////////////////////////////
 //! Run CUDA test. In-Place Multiple Kernel
 ////////////////////////////////////////////////////////////////////////////////
-float runCUDATest_InPlaceM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize, const int threads_per_block, const int cutoff){
+float runCUDACholeskyByTheBookInPlaceM(float* h_Adata, float* h_Ldata, const unsigned int dimensionSize, const int threads_per_block, const int cutoff){
     cudaEvent_t start, stop;
     gpuErrchk(cudaEventCreate(&start));
     gpuErrchk(cudaEventCreate(&stop));
@@ -606,17 +606,17 @@ float runCUDATest_InPlaceM(float* h_Adata, float* h_Ldata, const unsigned int di
     if (cutoff > 0) {
         for (j = 0; j < dimensionSize - cutoff; j++) {
             num_blocks = ceil((float)(dimensionSize - j) / (float)threads_per_block);
-            choleskyKernel_InPlaceM1 <<< 1, 1 >> > (d_Adata, dimensionSize, j);
-            choleskyKernel_InPlaceM2 << < num_blocks, threads_per_block >> > (d_Adata, dimensionSize, j);
+            choleskyByTheBookInPlaceDiagonal <<< 1, 1 >> > (d_Adata, dimensionSize, j);
+            choleskyByTheBookInPlaceBelowDiagonal << < num_blocks, threads_per_block >> > (d_Adata, dimensionSize, j);
         }
     }
     else {
         for (j = 0; j < dimensionSize - 1; j++) {
             num_blocks = ceil((float)(dimensionSize - j) / (float)threads_per_block);
-            choleskyKernel_InPlaceM1 <<< 1, 1 >> > (d_Adata, dimensionSize, j);
-            choleskyKernel_InPlaceM2 <<< num_blocks, threads_per_block >> > (d_Adata, dimensionSize, j);
+            choleskyByTheBookInPlaceDiagonal <<< 1, 1 >> > (d_Adata, dimensionSize, j);
+            choleskyByTheBookInPlaceBelowDiagonal <<< num_blocks, threads_per_block >> > (d_Adata, dimensionSize, j);
         }
-        choleskyKernel_InPlaceM1 <<< 1, 1 >> > (d_Adata, dimensionSize, j);
+        choleskyByTheBookInPlaceDiagonal <<< 1, 1 >> > (d_Adata, dimensionSize, j);
     }
 
 
