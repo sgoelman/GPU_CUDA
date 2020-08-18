@@ -1,8 +1,0 @@
-How many times is each element of the input matrices loaded during the execution of the kernel?
-1 times
-What is the memory-access to floating-point computation ratio in each thread? 
-Consider a multiply and addition as separate operations, and ignore the storing of the result. Only global memory loads should be counted towards your off-chip bandwidth
-
-each thread load 2 cell to memory  and do 64 command (multiply and addiation -> 32 multply and 32 addiation for each vector (block size) multipication ) then the ratio is 1:32
-
- 
